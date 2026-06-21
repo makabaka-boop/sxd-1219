@@ -119,9 +119,7 @@ class ReservationViewSet(viewsets.ModelViewSet):
         return conflicts.exists()
 
     def create(self, request, *args, **kwargs):
-        data = request.data.copy()
-        data['user'] = request.user.id
-        serializer = self.get_serializer(data=data)
+        serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         locker_id = serializer.validated_data['locker'].id
@@ -129,18 +127,44 @@ class ReservationViewSet(viewsets.ModelViewSet):
         end_time = serializer.validated_data['end_time']
 
         locker = Locker.objects.get(id=locker_id)
-        if locker.status != Locker.STATUS_AVAILABLE:
-            return Response({'error': '该柜格当前不可预约'}, status=status.HTTP_400_BAD_REQUEST)
+        if locker.status == Locker.STATUS_PAUSED:
+            return Response({'error': '该柜格已暂停开放，暂不可预约'}, status=status.HTTP_400_BAD_REQUEST)
 
         if self.check_time_conflict(locker_id, start_time, end_time):
             return Response({'error': '该柜格在该时间段已被预约'}, status=status.HTTP_400_BAD_REQUEST)
 
-        self.perform_create(serializer)
-        locker.status = Locker.STATUS_RESERVED
-        locker.save()
+        reservation = serializer.save(user=request.user)
+        self._update_locker_status(locker)
 
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def _update_locker_status(self, locker):
+        now = timezone.now()
+        active_count = Reservation.objects.filter(
+            locker=locker,
+            status__in=[Reservation.STATUS_PENDING, Reservation.STATUS_ACTIVE]
+        ).count()
+        if locker.status == Locker.STATUS_PAUSED:
+            return
+        if Reservation.objects.filter(
+            locker=locker,
+            status=Reservation.STATUS_ACTIVE,
+            start_time__lte=now,
+            end_time__gte=now
+        ).exists():
+            locker.status = Locker.STATUS_IN_USE
+        elif Reservation.objects.filter(
+            locker=locker,
+            status=Reservation.STATUS_COMPLETED,
+            cleaned=False
+        ).exists():
+            locker.status = Locker.STATUS_PENDING_CLEAN
+        elif active_count > 0:
+            locker.status = Locker.STATUS_RESERVED
+        else:
+            locker.status = Locker.STATUS_AVAILABLE
+        locker.save()
 
     @action(detail=True, methods=['post'], permission_classes=[IsOwnerOrAdmin])
     def cancel(self, request, pk=None):
@@ -149,13 +173,7 @@ class ReservationViewSet(viewsets.ModelViewSet):
             return Response({'error': '该预约状态不可取消'}, status=status.HTTP_400_BAD_REQUEST)
         reservation.status = Reservation.STATUS_CANCELLED
         reservation.save()
-        locker = reservation.locker
-        if Reservation.objects.filter(
-            locker=locker,
-            status__in=[Reservation.STATUS_PENDING, Reservation.STATUS_ACTIVE]
-        ).exclude(id=reservation.id).count() == 0:
-            locker.status = Locker.STATUS_AVAILABLE
-            locker.save()
+        self._update_locker_status(reservation.locker)
         return Response(ReservationSerializer(reservation).data)
 
     @action(detail=True, methods=['post'], permission_classes=[IsOwnerOrAdmin])
@@ -165,8 +183,7 @@ class ReservationViewSet(viewsets.ModelViewSet):
             return Response({'error': '该预约状态不可确认使用'}, status=status.HTTP_400_BAD_REQUEST)
         reservation.status = Reservation.STATUS_ACTIVE
         reservation.save()
-        reservation.locker.status = Locker.STATUS_IN_USE
-        reservation.locker.save()
+        self._update_locker_status(reservation.locker)
         return Response(ReservationSerializer(reservation).data)
 
     @action(detail=True, methods=['post'], permission_classes=[IsOwnerOrAdmin])
@@ -176,8 +193,7 @@ class ReservationViewSet(viewsets.ModelViewSet):
             return Response({'error': '该预约状态不可结束'}, status=status.HTTP_400_BAD_REQUEST)
         reservation.status = Reservation.STATUS_COMPLETED
         reservation.save()
-        reservation.locker.status = Locker.STATUS_PENDING_CLEAN
-        reservation.locker.save()
+        self._update_locker_status(reservation.locker)
         return Response(ReservationSerializer(reservation).data)
 
     @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
@@ -190,10 +206,7 @@ class ReservationViewSet(viewsets.ModelViewSet):
         reservation.cleaned_at = timezone.now()
         reservation.clean_note = request.data.get('clean_note', '')
         reservation.save()
-        locker = reservation.locker
-        if locker.status == Locker.STATUS_PENDING_CLEAN:
-            locker.status = Locker.STATUS_AVAILABLE
-            locker.save()
+        self._update_locker_status(reservation.locker)
         return Response(ReservationSerializer(reservation).data)
 
 
