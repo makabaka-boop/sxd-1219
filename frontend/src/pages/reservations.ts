@@ -1,6 +1,6 @@
 import { api } from '../utils/api';
 import { isAdmin } from '../utils/auth';
-import type { Reservation, ReservationStatus } from '../types';
+import type { Reservation, ReservationStatus, RenewalStatus, CreateRenewalRequest } from '../types';
 
 let reservations: Reservation[] = [];
 let currentFilter: ReservationStatus | 'all' = 'all';
@@ -61,6 +61,20 @@ function getStatusTag(status: ReservationStatus): string {
   return `<span class="tag ${s.class}">${s.text}</span>`;
 }
 
+function getRenewalStatusTag(status: RenewalStatus): string {
+  const statusMap: Record<RenewalStatus, { text: string; class: string }> = {
+    pending: { text: '待审批', class: 'tag-warning' },
+    approved: { text: '已通过', class: 'tag-success' },
+    rejected: { text: '已拒绝', class: 'tag-danger' },
+  };
+  const s = statusMap[status];
+  return `<span class="tag ${s.class}">${s.text}</span>`;
+}
+
+function hasPendingRenewal(r: Reservation): boolean {
+  return !!r.renewal_applications?.some((a) => a.status === 'pending');
+}
+
 function formatDateTime(dt: string): string {
   return dt.replace('T', ' ').slice(0, 16);
 }
@@ -119,6 +133,8 @@ function renderList(container: HTMLElement): void {
               <div class="action-buttons">
                 ${r.status === 'pending' ? `<button class="btn btn-small btn-primary" data-action="confirm" data-id="${r.id}">确认使用</button>` : ''}
                 ${r.status === 'active' ? `<button class="btn btn-small btn-success" data-action="finish" data-id="${r.id}">结束使用</button>` : ''}
+                ${r.status === 'active' && !hasPendingRenewal(r) ? `<button class="btn btn-small btn-warning" data-action="renew" data-id="${r.id}">申请续期</button>` : ''}
+                ${r.status === 'active' && hasPendingRenewal(r) ? `<span class="tag tag-warning" style="align-self:center;">续期审批中</span>` : ''}
                 ${(r.status === 'pending' || r.status === 'active') ? `<button class="btn btn-small btn-danger" data-action="cancel" data-id="${r.id}">取消预约</button>` : ''}
                 ${adminMode && r.status === 'completed' && !r.cleaned ? `<button class="btn btn-small btn-warning" data-action="clean" data-id="${r.id}">登记清理</button>` : ''}
                 <button class="btn btn-small" data-action="detail" data-id="${r.id}">详情</button>
@@ -150,6 +166,8 @@ function renderList(container: HTMLElement): void {
         handleAction('cancel', reservation, container, '确认要取消此预约吗？');
       } else if (action === 'clean') {
         showCleanDialog(reservation, container);
+      } else if (action === 'renew') {
+        showRenewDialog(reservation, container);
       }
     });
   });
@@ -168,6 +186,7 @@ async function handleAction(action: string, reservation: Reservation, container:
 }
 
 function showDetail(r: Reservation): void {
+  const renewals = r.renewal_applications || [];
   const modal = document.createElement('div');
   modal.className = 'modal-mask';
   modal.innerHTML = `
@@ -186,6 +205,26 @@ function showDetail(r: Reservation): void {
         <div class="detail-row"><span class="detail-label">清理状态</span><span class="detail-value">${r.cleaned ? `已清理${r.cleaned_by_info ? ' · ' + r.cleaned_by_info.username : ''}${r.cleaned_at ? ' · ' + formatDateTime(r.cleaned_at) : ''}` : '未清理'}</span></div>
         ${r.clean_note ? `<div class="detail-row"><span class="detail-label">清理备注</span><span class="detail-value">${r.clean_note}</span></div>` : ''}
         <div class="detail-row"><span class="detail-label">创建时间</span><span class="detail-value">${formatDateTime(r.created_at)}</span></div>
+        <hr style="margin:16px 0;border:none;border-top:1px solid #ebeef5;" />
+        <h4 style="margin-bottom:12px;font-size:14px;">续期记录</h4>
+        ${renewals.length === 0
+          ? '<div style="color:#909399;font-size:13px;">暂无续期申请</div>'
+          : renewals.map((a) => `
+            <div style="border:1px solid #ebeef5;border-radius:6px;padding:12px;margin-bottom:10px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                <span style="font-weight:500;">续期申请 #${a.id}</span>
+                ${getRenewalStatusTag(a.status)}
+              </div>
+              <div style="font-size:13px;color:#606266;line-height:1.8;">
+                <div>原结束时间：${formatDateTime(a.original_end_time)} → 期望结束时间：${formatDateTime(a.requested_end_time)}</div>
+                <div>申请原因：${a.reason}</div>
+                <div>申请人：${a.user_info.username} · 申请时间：${formatDateTime(a.created_at)}</div>
+                ${a.reviewed_at ? `<div>审批人：${a.reviewer_info?.username || '-'} · 审批时间：${formatDateTime(a.reviewed_at)}</div>` : ''}
+                ${a.review_note ? `<div>审批备注：${a.review_note}</div>` : ''}
+              </div>
+            </div>
+          `).join('')
+        }
       </div>
     </div>
   `;
@@ -245,6 +284,110 @@ function showCleanDialog(r: Reservation, container: HTMLElement): void {
       renderList(container);
     } catch (err: any) {
       errEl.textContent = err.message || '登记失败';
+      errEl.style.display = 'block';
+    }
+  });
+}
+
+function showRenewDialog(r: Reservation, container: HTMLElement): void {
+  const formatLocal = (d: Date) => {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+  const currentEnd = new Date(r.end_time);
+  const defaultEnd = new Date(currentEnd.getTime() + 24 * 60 * 60 * 1000);
+
+  const modal = document.createElement('div');
+  modal.className = 'modal-mask';
+  modal.innerHTML = `
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">申请续期 - ${r.locker_info.code}</span>
+        <button class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="detail-row"><span class="detail-label">柜格</span><span class="detail-value">${r.locker_info.code} (${r.locker_info.group_name})</span></div>
+        <div class="detail-row"><span class="detail-label">当前结束时间</span><span class="detail-value">${formatDateTime(r.end_time)}</span></div>
+        <hr style="margin:16px 0;border:none;border-top:1px solid #ebeef5;" />
+        <div id="renewHint" style="margin-bottom:12px;font-size:13px;color:#909399;">正在加载该柜格近期预约...</div>
+        <form id="renewForm">
+          <div class="form-item">
+            <label class="form-label">期望延长结束时间 *</label>
+            <input type="datetime-local" name="requested_end_time" class="form-input" value="${formatLocal(defaultEnd)}" required />
+          </div>
+          <div class="form-item">
+            <label class="form-label">申请原因 *</label>
+            <textarea name="reason" class="form-textarea" placeholder="请填写续期原因，如：工作未完成、需继续存放物品等" required></textarea>
+          </div>
+          <div id="renewError" style="color:#f56c6c;font-size:13px;margin-bottom:12px;display:none;"></div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" id="cancelRenewBtn">取消</button>
+        <button class="btn btn-primary" id="submitRenewBtn">提交申请</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  const close = () => document.body.removeChild(modal);
+  modal.querySelector('.modal-close')?.addEventListener('click', close);
+  modal.querySelector('#cancelRenewBtn')?.addEventListener('click', close);
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) close();
+  });
+
+  const hintEl = modal.querySelector('#renewHint') as HTMLElement;
+  api.get<Reservation[]>(`/lockers/${r.locker_info.id}/recent_reservations/`)
+    .then((recent) => {
+      const upcoming = recent.filter(
+        (x) => x.id !== r.id && (x.status === 'pending' || x.status === 'active')
+      );
+      if (upcoming.length === 0) {
+        hintEl.innerHTML = '<span style="color:#67c23a;">该柜格近期暂无其它占用预约，可放心申请续期。</span>';
+      } else {
+        hintEl.innerHTML = `
+          <div style="color:#e6a23c;margin-bottom:6px;">该柜格近期已有其它预约，续期时间请勿与之冲突：</div>
+          ${upcoming.map((x) => `
+            <div style="margin-bottom:4px;">· ${x.status === 'active' ? '使用中' : '待使用'} ${formatDateTime(x.start_time)} 至 ${formatDateTime(x.end_time)}${x.user_info ? '（' + x.user_info.username + '）' : ''}</div>
+          `).join('')}
+        `;
+      }
+    })
+    .catch(() => {
+      hintEl.textContent = '';
+    });
+
+  modal.querySelector('#submitRenewBtn')?.addEventListener('click', async () => {
+    const form = modal.querySelector('#renewForm') as HTMLFormElement;
+    const formData = new FormData(form);
+    const errEl = modal.querySelector('#renewError') as HTMLElement;
+    errEl.style.display = 'none';
+    const requestedEnd = (formData.get('requested_end_time') as string).replace('T', ' ');
+    const reason = (formData.get('reason') as string) || '';
+    if (!requestedEnd) {
+      errEl.textContent = '请选择期望延长结束时间';
+      errEl.style.display = 'block';
+      return;
+    }
+    if (!reason.trim()) {
+      errEl.textContent = '请填写申请原因';
+      errEl.style.display = 'block';
+      return;
+    }
+    const data: CreateRenewalRequest = {
+      reservation: r.id,
+      requested_end_time: requestedEnd,
+      reason: reason.trim(),
+    };
+    try {
+      await api.post('/renewals/', data);
+      close();
+      alert('续期申请已提交，等待管理员审批');
+      await loadData();
+      renderList(container);
+    } catch (err: any) {
+      errEl.textContent = err.message || '提交失败';
       errEl.style.display = 'block';
     }
   });

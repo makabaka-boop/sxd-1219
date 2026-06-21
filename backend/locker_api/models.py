@@ -109,3 +109,35 @@ class Reservation(models.Model):
 
     def __str__(self):
         return f'{self.user.username} - {self.locker.code}'
+
+
+class RenewalApplication(models.Model):
+    STATUS_PENDING = 'pending'
+    STATUS_APPROVED = 'approved'
+    STATUS_REJECTED = 'rejected'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, '待审批'),
+        (STATUS_APPROVED, '已通过'),
+        (STATUS_REJECTED, '已拒绝'),
+    ]
+
+    reservation = models.ForeignKey(Reservation, on_delete=models.CASCADE, related_name='renewal_applications', verbose_name='原预约')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='renewal_applications', verbose_name='申请人')
+    original_end_time = models.DateTimeField(verbose_name='原结束时间')
+    requested_end_time = models.DateTimeField(verbose_name='期望结束时间')
+    reason = models.TextField(verbose_name='申请原因')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING, verbose_name='审批状态')
+    reviewer = models.ForeignKey(User, on_delete=models.SET_NULL, blank=True, null=True, related_name='reviewed_renewals', verbose_name='审批人')
+    reviewed_at = models.DateTimeField(blank=True, null=True, verbose_name='审批时间')
+    review_note = models.TextField(blank=True, null=True, verbose_name='审批备注')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'renewal_application'
+        verbose_name = '续期申请'
+        verbose_name_plural = '续期申请'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'续期申请 #{self.id} - 预约#{self.reservation_id}({self.get_status_display()})'

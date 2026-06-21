@@ -1,5 +1,5 @@
 import { api } from '../utils/api';
-import type { Locker, LockerGroup, LockerSize, LockerStatus, CreateReservationRequest } from '../types';
+import type { Locker, LockerGroup, LockerSize, LockerStatus, CreateReservationRequest, Reservation, RenewalStatus } from '../types';
 
 let groups: LockerGroup[] = [];
 let lockers: Locker[] = [];
@@ -125,6 +125,31 @@ function getSizeText(size: LockerSize): string {
   return sizeMap[size];
 }
 
+function formatDateTime(dt: string): string {
+  return dt.replace('T', ' ').slice(0, 16);
+}
+
+function getReservationStatusTag(status: string): string {
+  const map: Record<string, { text: string; class: string }> = {
+    pending: { text: '待使用', class: 'tag-primary' },
+    active: { text: '使用中', class: 'tag-warning' },
+    completed: { text: '已完成', class: 'tag-success' },
+    cancelled: { text: '已取消', class: 'tag-info' },
+  };
+  const s = map[status] || { text: status, class: 'tag-info' };
+  return `<span class="tag ${s.class}">${s.text}</span>`;
+}
+
+function getRenewalStatusTag(status: RenewalStatus): string {
+  const map: Record<RenewalStatus, { text: string; class: string }> = {
+    pending: { text: '待审批', class: 'tag-warning' },
+    approved: { text: '已通过', class: 'tag-success' },
+    rejected: { text: '已拒绝', class: 'tag-danger' },
+  };
+  const s = map[status];
+  return `<span class="tag ${s.class}">${s.text}</span>`;
+}
+
 function renderLockerList(container: HTMLElement): void {
   const listEl = container.querySelector('#lockerList')!;
   if (loading) {
@@ -188,6 +213,9 @@ function showLockerDetail(locker: Locker): void {
         <div class="detail-row"><span class="detail-label">尺寸</span><span class="detail-value">${getSizeText(locker.size)}</span></div>
         <div class="detail-row"><span class="detail-label">状态</span><span class="detail-value">${getStatusTag(locker.status)}</span></div>
         ${locker.description ? `<div class="detail-row"><span class="detail-label">备注</span><span class="detail-value">${locker.description}</span></div>` : ''}
+        <hr style="margin:16px 0;border:none;border-top:1px solid #ebeef5;" />
+        <h4 style="margin-bottom:12px;font-size:14px;">近期预约占用</h4>
+        <div id="recentReservations" style="font-size:13px;color:#909399;">加载中...</div>
         ${locker.status === 'available' ? `
           <hr style="margin:16px 0;border:none;border-top:1px solid #ebeef5;" />
           <h4 style="margin-bottom:12px;font-size:14px;">预约此柜格</h4>
@@ -218,6 +246,40 @@ function showLockerDetail(locker: Locker): void {
   modal.addEventListener('click', (e) => {
     if (e.target === modal) close();
   });
+
+  const recentEl = modal.querySelector('#recentReservations') as HTMLElement;
+  api.get<Reservation[]>(`/lockers/${locker.id}/recent_reservations/`)
+    .then((recent) => {
+      if (recent.length === 0) {
+        recentEl.innerHTML = '<span style="color:#67c23a;">该柜格暂无预约记录。</span>';
+        return;
+      }
+      recentEl.innerHTML = recent.map((r) => {
+        const renewals = r.renewal_applications || [];
+        return `
+          <div style="border:1px solid #ebeef5;border-radius:6px;padding:10px;margin-bottom:8px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+              <span style="font-weight:500;">预约 #${r.id} · ${r.user_info.username}</span>
+              ${getReservationStatusTag(r.status)}
+            </div>
+            <div style="line-height:1.7;">
+              <div>${formatDateTime(r.start_time)} 至 ${formatDateTime(r.end_time)}</div>
+              ${renewals.length > 0 ? `
+                <div style="margin-top:4px;color:#909399;">续期记录：</div>
+                ${renewals.map((a) => `
+                  <div style="margin-top:2px;padding-left:8px;border-left:2px solid #dcdfe6;">
+                    ${getRenewalStatusTag(a.status)} 期望至 ${formatDateTime(a.requested_end_time)}${a.review_note ? ' · ' + a.review_note : ''}
+                  </div>
+                `).join('')}
+              ` : '<div style="margin-top:4px;color:#c0c4cc;">无续期记录</div>'}
+            </div>
+          </div>
+        `;
+      }).join('');
+    })
+    .catch(() => {
+      recentEl.innerHTML = '<span style="color:#f56c6c;">近期预约加载失败</span>';
+    });
 
   const reserveForm = modal.querySelector('#reserveForm') as HTMLFormElement;
   if (reserveForm) {

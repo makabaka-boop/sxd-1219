@@ -38,6 +38,27 @@ export interface Locker {
 
 export type ReservationStatus = 'pending' | 'active' | 'completed' | 'cancelled';
 
+export type RenewalStatus = 'pending' | 'approved' | 'rejected';
+
+export interface RenewalApplication {
+  id: number;
+  reservation: number;
+  reservation_info?: Reservation;
+  user: number;
+  user_info: User;
+  original_end_time: string;
+  requested_end_time: string;
+  reason: string;
+  status: RenewalStatus;
+  status_display: string;
+  reviewer?: number;
+  reviewer_info?: User;
+  reviewed_at?: string;
+  review_note?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Reservation {
   id: number;
   user: number;
@@ -54,6 +75,7 @@ export interface Reservation {
   cleaned_by_info?: User;
   cleaned_at?: string;
   clean_note?: string;
+  renewal_applications?: RenewalApplication[];
   created_at: string;
   updated_at: string;
 }
@@ -72,6 +94,9 @@ export interface Stats {
   pending_clean_reservations: number;
   total_groups: number;
   total_users: number;
+  pending_renewals: number;
+  approved_renewals: number;
+  rejected_renewals: number;
 }
 
 export interface AuthResponse {
@@ -98,4 +123,14 @@ export interface CreateReservationRequest {
   start_time: string;
   end_time: string;
   purpose?: string;
+}
+
+export interface CreateRenewalRequest {
+  reservation: number;
+  requested_end_time: string;
+  reason: string;
+}
+
+export interface ReviewRenewalRequest {
+  review_note?: string;
 }

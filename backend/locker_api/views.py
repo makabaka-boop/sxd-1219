@@ -8,10 +8,11 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate, get_user_model
 
-from .models import LockerGroup, Locker, Reservation
+from .models import LockerGroup, Locker, Reservation, RenewalApplication
 from .serializers import (
     UserSerializer, RegisterSerializer,
-    LockerGroupSerializer, LockerSerializer, ReservationSerializer
+    LockerGroupSerializer, LockerSerializer, ReservationSerializer,
+    RenewalApplicationSerializer
 )
 from .permissions import IsAdmin, IsAdminOrReadOnly, IsOwnerOrAdmin
 
@@ -86,6 +87,17 @@ class LockerViewSet(viewsets.ModelViewSet):
     def available(self, request):
         queryset = self.get_queryset().filter(status=Locker.STATUS_AVAILABLE)
         serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def recent_reservations(self, request, pk=None):
+        locker = self.get_object()
+        reservations = Reservation.objects.filter(
+            locker=locker
+        ).select_related(
+            'user', 'locker', 'locker__locker_group', 'cleaned_by'
+        ).order_by('-created_at')[:5]
+        serializer = ReservationSerializer(reservations, many=True)
         return Response(serializer.data)
 
 
@@ -210,6 +222,137 @@ class ReservationViewSet(viewsets.ModelViewSet):
         return Response(ReservationSerializer(reservation).data)
 
 
+class RenewalApplicationViewSet(viewsets.ModelViewSet):
+    queryset = RenewalApplication.objects.select_related(
+        'reservation', 'reservation__locker', 'reservation__locker__locker_group',
+        'reservation__user', 'user', 'reviewer'
+    ).all()
+    serializer_class = RenewalApplicationSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        user = self.request.user
+        if user.role != 'admin':
+            queryset = queryset.filter(user=user)
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        reservation_id = self.request.query_params.get('reservation')
+        if reservation_id:
+            queryset = queryset.filter(reservation_id=reservation_id)
+        return queryset
+
+    def check_renewal_conflict(self, reservation, requested_end_time):
+        conflicts = Reservation.objects.filter(
+            locker_id=reservation.locker_id,
+            status__in=[Reservation.STATUS_PENDING, Reservation.STATUS_ACTIVE]
+        ).filter(
+            Q(start_time__lt=requested_end_time) & Q(end_time__gt=reservation.start_time)
+        ).exclude(id=reservation.id)
+        return conflicts.exists()
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        reservation = serializer.validated_data['reservation']
+        requested_end_time = serializer.validated_data['requested_end_time']
+
+        if request.user.role != 'admin' and reservation.user_id != request.user.id:
+            return Response({'error': '只能对自己的预约申请续期'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if reservation.status != Reservation.STATUS_ACTIVE:
+            return Response({'error': '仅使用中的预约可申请续期'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if RenewalApplication.objects.filter(
+            reservation=reservation, status=RenewalApplication.STATUS_PENDING
+        ).exists():
+            return Response({'error': '该预约已有待审批的续期申请'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if requested_end_time <= reservation.end_time:
+            return Response({'error': '续期时间必须晚于当前结束时间'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if self.check_renewal_conflict(reservation, requested_end_time):
+            return Response({'error': '续期时间与该柜格后续预约冲突'}, status=status.HTTP_400_BAD_REQUEST)
+
+        application = serializer.save(
+            user=request.user,
+            original_end_time=reservation.end_time,
+        )
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def approve(self, request, pk=None):
+        application = self.get_object()
+        if application.status != RenewalApplication.STATUS_PENDING:
+            return Response({'error': '该申请已处理，不可重复审批'}, status=status.HTTP_400_BAD_REQUEST)
+
+        reservation = application.reservation
+        if reservation.status != Reservation.STATUS_ACTIVE:
+            return Response({'error': '原预约已不在使用中，无法续期'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if self.check_renewal_conflict(reservation, application.requested_end_time):
+            return Response({'error': '续期时间与该柜格后续预约冲突，审批失败'}, status=status.HTTP_400_BAD_REQUEST)
+
+        reservation.end_time = application.requested_end_time
+        reservation.save()
+
+        application.status = RenewalApplication.STATUS_APPROVED
+        application.reviewer = request.user
+        application.reviewed_at = timezone.now()
+        application.review_note = request.data.get('review_note', '')
+        application.save()
+
+        self._refresh_locker_status(reservation.locker)
+        return Response(RenewalApplicationSerializer(application).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdmin])
+    def reject(self, request, pk=None):
+        application = self.get_object()
+        if application.status != RenewalApplication.STATUS_PENDING:
+            return Response({'error': '该申请已处理，不可重复审批'}, status=status.HTTP_400_BAD_REQUEST)
+
+        review_note = request.data.get('review_note', '')
+        if not review_note:
+            return Response({'error': '拒绝时请填写拒绝原因'}, status=status.HTTP_400_BAD_REQUEST)
+
+        application.status = RenewalApplication.STATUS_REJECTED
+        application.reviewer = request.user
+        application.reviewed_at = timezone.now()
+        application.review_note = review_note
+        application.save()
+        return Response(RenewalApplicationSerializer(application).data)
+
+    def _refresh_locker_status(self, locker):
+        now = timezone.now()
+        if locker.status == Locker.STATUS_PAUSED:
+            return
+        active_count = Reservation.objects.filter(
+            locker=locker,
+            status__in=[Reservation.STATUS_PENDING, Reservation.STATUS_ACTIVE]
+        ).count()
+        if Reservation.objects.filter(
+            locker=locker,
+            status=Reservation.STATUS_ACTIVE,
+            start_time__lte=now,
+            end_time__gte=now
+        ).exists():
+            locker.status = Locker.STATUS_IN_USE
+        elif Reservation.objects.filter(
+            locker=locker,
+            status=Reservation.STATUS_COMPLETED,
+            cleaned=False
+        ).exists():
+            locker.status = Locker.STATUS_PENDING_CLEAN
+        elif active_count > 0:
+            locker.status = Locker.STATUS_RESERVED
+        else:
+            locker.status = Locker.STATUS_AVAILABLE
+        locker.save()
+
+
 @api_view(['GET'])
 @permission_classes([IsAdmin])
 def stats_view(request):
@@ -229,5 +372,8 @@ def stats_view(request):
         ).count(),
         'total_groups': LockerGroup.objects.count(),
         'total_users': User.objects.filter(role='user').count(),
+        'pending_renewals': RenewalApplication.objects.filter(status=RenewalApplication.STATUS_PENDING).count(),
+        'approved_renewals': RenewalApplication.objects.filter(status=RenewalApplication.STATUS_APPROVED).count(),
+        'rejected_renewals': RenewalApplication.objects.filter(status=RenewalApplication.STATUS_REJECTED).count(),
     }
     return Response(data)

@@ -1,11 +1,13 @@
 import { api } from '../utils/api';
-import type { Stats, LockerGroup, Locker, Reservation, LockerSize, LockerStatus } from '../types';
+import type { Stats, LockerGroup, Locker, Reservation, LockerSize, LockerStatus, RenewalApplication, RenewalStatus } from '../types';
 
-let currentTab: 'overview' | 'groups' | 'lockers' | 'reservations' = 'overview';
+let currentTab: 'overview' | 'groups' | 'lockers' | 'reservations' | 'renewals' = 'overview';
 let stats: Stats | null = null;
 let groups: LockerGroup[] = [];
 let lockers: Locker[] = [];
 let reservations: Reservation[] = [];
+let renewals: RenewalApplication[] = [];
+let renewalFilter: RenewalStatus | 'all' = 'all';
 let loading = false;
 
 export async function renderAdmin(container: HTMLElement): Promise<void> {
@@ -18,6 +20,7 @@ export async function renderAdmin(container: HTMLElement): Promise<void> {
       <div class="tab ${currentTab === 'groups' ? 'active' : ''}" data-tab="groups">柜组管理</div>
       <div class="tab ${currentTab === 'lockers' ? 'active' : ''}" data-tab="lockers">柜格管理</div>
       <div class="tab ${currentTab === 'reservations' ? 'active' : ''}" data-tab="reservations">预约记录</div>
+      <div class="tab ${currentTab === 'renewals' ? 'active' : ''}" data-tab="renewals">续期审批</div>
     </div>
     <div id="adminContent"></div>
   `;
@@ -51,6 +54,12 @@ async function loadCurrentTab(): Promise<void> {
       ]);
     } else if (currentTab === 'reservations') {
       reservations = await api.get<Reservation[]>('/reservations/');
+    } else if (currentTab === 'renewals') {
+      let url = '/renewals/';
+      if (renewalFilter !== 'all') {
+        url += `?status=${renewalFilter}`;
+      }
+      renewals = await api.get<RenewalApplication[]>(url);
     }
   } catch (err) {
     console.error(err);
@@ -60,7 +69,7 @@ async function loadCurrentTab(): Promise<void> {
 }
 
 function renderCurrentTab(container: HTMLElement): void {
-  const content = container.querySelector('#adminContent')!;
+  const content = container.querySelector('#adminContent') as HTMLElement;
   if (loading) {
     content.innerHTML = '<div class="empty-state"><div class="empty-state-icon">⏳</div><div class="empty-state-text">加载中...</div></div>';
     return;
@@ -77,6 +86,9 @@ function renderCurrentTab(container: HTMLElement): void {
       break;
     case 'reservations':
       renderReservations(content, container);
+      break;
+    case 'renewals':
+      renderRenewals(content, container);
       break;
   }
 }
@@ -102,6 +114,14 @@ function renderOverview(content: HTMLElement): void {
         <div class="stat-card warning"><div class="stat-card-title">使用中</div><div class="stat-card-value">${stats.active_reservations}</div></div>
         <div class="stat-card success"><div class="stat-card-title">已完成</div><div class="stat-card-value">${stats.completed_reservations}</div></div>
         <div class="stat-card danger"><div class="stat-card-title">待清理预约</div><div class="stat-card-value">${stats.pending_clean_reservations}</div></div>
+      </div>
+    </div>
+    <div class="card" style="margin-top:24px;">
+      <h3 style="margin-bottom:16px;font-size:16px;">续期申请统计</h3>
+      <div class="grid stats-grid">
+        <div class="stat-card warning"><div class="stat-card-title">待审批</div><div class="stat-card-value">${stats.pending_renewals}</div></div>
+        <div class="stat-card success"><div class="stat-card-title">已通过</div><div class="stat-card-value">${stats.approved_renewals}</div></div>
+        <div class="stat-card danger"><div class="stat-card-title">已拒绝</div><div class="stat-card-value">${stats.rejected_renewals}</div></div>
       </div>
     </div>
   `;
@@ -529,6 +549,266 @@ function showCleanDialog(r: Reservation, container: HTMLElement): void {
       renderCurrentTab(container);
     } catch (err: any) {
       errEl.textContent = err.message || '登记失败';
+      errEl.style.display = 'block';
+    }
+  });
+}
+
+function getRenewalStatusTag(status: RenewalStatus): string {
+  const map: Record<RenewalStatus, { text: string; class: string }> = {
+    pending: { text: '待审批', class: 'tag-warning' },
+    approved: { text: '已通过', class: 'tag-success' },
+    rejected: { text: '已拒绝', class: 'tag-danger' },
+  };
+  const s = map[status];
+  return `<span class="tag ${s.class}">${s.text}</span>`;
+}
+
+function renderRenewals(content: HTMLElement, container: HTMLElement): void {
+  const formatDateTime = (dt: string) => dt ? dt.replace('T', ' ').slice(0, 16) : '-';
+  content.innerHTML = `
+    <div class="tabs" id="renewalTabs" style="margin-bottom:16px;">
+      <div class="tab ${renewalFilter === 'all' ? 'active' : ''}" data-rfilter="all">全部</div>
+      <div class="tab ${renewalFilter === 'pending' ? 'active' : ''}" data-rfilter="pending">待审批</div>
+      <div class="tab ${renewalFilter === 'approved' ? 'active' : ''}" data-rfilter="approved">已通过</div>
+      <div class="tab ${renewalFilter === 'rejected' ? 'active' : ''}" data-rfilter="rejected">已拒绝</div>
+    </div>
+    <table class="table">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>申请人</th>
+          <th>柜格</th>
+          <th>原结束时间</th>
+          <th>期望结束时间</th>
+          <th>申请原因</th>
+          <th>状态</th>
+          <th>审批信息</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${renewals.length === 0 ? '<tr><td colspan="9" style="text-align:center;color:#909399;padding:40px;">暂无续期申请</td></tr>' : renewals.map((a) => `
+          <tr>
+            <td>#${a.id}</td>
+            <td>${a.user_info.username}</td>
+            <td>${a.reservation_info ? a.reservation_info.locker_info.code + ' (' + a.reservation_info.locker_info.group_name + ')' : '-'}<div style="color:#909399;font-size:12px;">预约 #${a.reservation}</div></td>
+            <td>${formatDateTime(a.original_end_time)}</td>
+            <td>${formatDateTime(a.requested_end_time)}</td>
+            <td style="max-width:200px;word-break:break-all;">${a.reason}</td>
+            <td>${getRenewalStatusTag(a.status)}</td>
+            <td style="font-size:12px;color:#909399;">
+              ${a.reviewer_info ? '审批人：' + a.reviewer_info.username : '-'}<br/>
+              ${a.reviewed_at ? formatDateTime(a.reviewed_at) : ''}${a.review_note ? '<br/>备注：' + a.review_note : ''}
+            </td>
+            <td>
+              <div class="action-buttons">
+                ${a.status === 'pending' ? `<button class="btn btn-small btn-success" data-action="approve" data-id="${a.id}">通过</button>` : ''}
+                ${a.status === 'pending' ? `<button class="btn btn-small btn-danger" data-action="reject" data-id="${a.id}">拒绝</button>` : ''}
+                <button class="btn btn-small" data-action="renewal-detail" data-id="${a.id}">详情</button>
+              </div>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+
+  content.querySelectorAll('#renewalTabs .tab').forEach((tab) => {
+    tab.addEventListener('click', async (e) => {
+      const target = e.currentTarget as HTMLElement;
+      renewalFilter = target.dataset.rfilter as RenewalStatus | 'all';
+      content.querySelectorAll('#renewalTabs .tab').forEach((t) => t.classList.remove('active'));
+      target.classList.add('active');
+      await loadCurrentTab();
+      renderCurrentTab(container);
+    });
+  });
+
+  content.querySelectorAll('button[data-action="approve"]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      const id = Number((e.currentTarget as HTMLElement).dataset.id);
+      const app = renewals.find((x) => x.id === id);
+      if (app) showApproveDialog(app, container);
+    });
+  });
+
+  content.querySelectorAll('button[data-action="reject"]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      const id = Number((e.currentTarget as HTMLElement).dataset.id);
+      const app = renewals.find((x) => x.id === id);
+      if (app) showRejectDialog(app, container);
+    });
+  });
+
+  content.querySelectorAll('button[data-action="renewal-detail"]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      const id = Number((e.currentTarget as HTMLElement).dataset.id);
+      const app = renewals.find((x) => x.id === id);
+      if (app) showRenewalDetail(app);
+    });
+  });
+}
+
+function showRenewalDetail(a: RenewalApplication): void {
+  const formatDateTime = (dt: string) => dt ? dt.replace('T', ' ').slice(0, 16) : '-';
+  const res = a.reservation_info;
+  const modal = document.createElement('div');
+  modal.className = 'modal-mask';
+  modal.innerHTML = `
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">续期申请详情 #${a.id}</span>
+        <button class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="detail-row"><span class="detail-label">申请状态</span><span class="detail-value">${getRenewalStatusTag(a.status)}</span></div>
+        <div class="detail-row"><span class="detail-label">申请人</span><span class="detail-value">${a.user_info.username}</span></div>
+        <div class="detail-row"><span class="detail-label">申请时间</span><span class="detail-value">${formatDateTime(a.created_at)}</span></div>
+        ${res ? `
+          <div class="detail-row"><span class="detail-label">关联预约</span><span class="detail-value">#${res.id} · ${res.locker_info.code} (${res.locker_info.group_name})</span></div>
+          <div class="detail-row"><span class="detail-label">预约时间</span><span class="detail-value">${formatDateTime(res.start_time)} 至 ${formatDateTime(res.end_time)}</span></div>
+        ` : `<div class="detail-row"><span class="detail-label">关联预约</span><span class="detail-value">#${a.reservation}</span></div>`}
+        <div class="detail-row"><span class="detail-label">原结束时间</span><span class="detail-value">${formatDateTime(a.original_end_time)}</span></div>
+        <div class="detail-row"><span class="detail-label">期望结束时间</span><span class="detail-value">${formatDateTime(a.requested_end_time)}</span></div>
+        <div class="detail-row"><span class="detail-label">申请原因</span><span class="detail-value">${a.reason}</span></div>
+        ${a.reviewer_info ? `
+          <hr style="margin:16px 0;border:none;border-top:1px solid #ebeef5;" />
+          <div class="detail-row"><span class="detail-label">审批人</span><span class="detail-value">${a.reviewer_info.username}</span></div>
+          <div class="detail-row"><span class="detail-label">审批时间</span><span class="detail-value">${formatDateTime(a.reviewed_at || '')}</span></div>
+          ${a.review_note ? `<div class="detail-row"><span class="detail-label">审批备注</span><span class="detail-value">${a.review_note}</span></div>` : ''}
+        ` : ''}
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  const close = () => document.body.removeChild(modal);
+  modal.querySelector('.modal-close')?.addEventListener('click', close);
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) close();
+  });
+}
+
+function showApproveDialog(a: RenewalApplication, container: HTMLElement): void {
+  const formatDateTime = (dt: string) => dt ? dt.replace('T', ' ').slice(0, 16) : '-';
+  const modal = document.createElement('div');
+  modal.className = 'modal-mask';
+  modal.innerHTML = `
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">审批通过 - 续期申请 #${a.id}</span>
+        <button class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="detail-row"><span class="detail-label">申请人</span><span class="detail-value">${a.user_info.username}</span></div>
+        <div class="detail-row"><span class="detail-label">原结束时间</span><span class="detail-value">${formatDateTime(a.original_end_time)}</span></div>
+        <div class="detail-row"><span class="detail-label">期望结束至</span><span class="detail-value">${formatDateTime(a.requested_end_time)}</span></div>
+        <div class="detail-row"><span class="detail-label">申请原因</span><span class="detail-value">${a.reason}</span></div>
+        <hr style="margin:16px 0;border:none;border-top:1px solid #ebeef5;" />
+        <form id="approveForm">
+          <div class="form-item">
+            <label class="form-label">审批备注</label>
+            <textarea name="review_note" class="form-textarea" placeholder="选填，如：同意续期"></textarea>
+          </div>
+          <div id="approveError" style="color:#f56c6c;font-size:13px;margin-bottom:12px;display:none;"></div>
+        </form>
+        <div style="color:#e6a23c;font-size:13px;">通过后，原预约结束时间将同步延长，柜格状态将自动流转。</div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" id="cancelApproveBtn">取消</button>
+        <button class="btn btn-success" id="submitApproveBtn">确认通过</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  const close = () => document.body.removeChild(modal);
+  modal.querySelector('.modal-close')?.addEventListener('click', close);
+  modal.querySelector('#cancelApproveBtn')?.addEventListener('click', close);
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) close();
+  });
+
+  modal.querySelector('#submitApproveBtn')?.addEventListener('click', async () => {
+    const form = modal.querySelector('#approveForm') as HTMLFormElement;
+    const formData = new FormData(form);
+    const errEl = modal.querySelector('#approveError') as HTMLElement;
+    errEl.style.display = 'none';
+    try {
+      await api.post(`/renewals/${a.id}/approve/`, {
+        review_note: (formData.get('review_note') as string) || '',
+      });
+      close();
+      alert('已通过续期申请，预约结束时间已更新');
+      await loadCurrentTab();
+      renderCurrentTab(container);
+    } catch (err: any) {
+      errEl.textContent = err.message || '操作失败';
+      errEl.style.display = 'block';
+    }
+  });
+}
+
+function showRejectDialog(a: RenewalApplication, container: HTMLElement): void {
+  const formatDateTime = (dt: string) => dt ? dt.replace('T', ' ').slice(0, 16) : '-';
+  const modal = document.createElement('div');
+  modal.className = 'modal-mask';
+  modal.innerHTML = `
+    <div class="modal">
+      <div class="modal-header">
+        <span class="modal-title">审批拒绝 - 续期申请 #${a.id}</span>
+        <button class="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="detail-row"><span class="detail-label">申请人</span><span class="detail-value">${a.user_info.username}</span></div>
+        <div class="detail-row"><span class="detail-label">原结束时间</span><span class="detail-value">${formatDateTime(a.original_end_time)}</span></div>
+        <div class="detail-row"><span class="detail-label">期望结束至</span><span class="detail-value">${formatDateTime(a.requested_end_time)}</span></div>
+        <div class="detail-row"><span class="detail-label">申请原因</span><span class="detail-value">${a.reason}</span></div>
+        <hr style="margin:16px 0;border:none;border-top:1px solid #ebeef5;" />
+        <form id="rejectForm">
+          <div class="form-item">
+            <label class="form-label">拒绝原因 *</label>
+            <textarea name="review_note" class="form-textarea" placeholder="请填写拒绝原因，如：续期时间与后续预约冲突" required></textarea>
+          </div>
+          <div id="rejectError" style="color:#f56c6c;font-size:13px;margin-bottom:12px;display:none;"></div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" id="cancelRejectBtn">取消</button>
+        <button class="btn btn-danger" id="submitRejectBtn">确认拒绝</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  const close = () => document.body.removeChild(modal);
+  modal.querySelector('.modal-close')?.addEventListener('click', close);
+  modal.querySelector('#cancelRejectBtn')?.addEventListener('click', close);
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) close();
+  });
+
+  modal.querySelector('#submitRejectBtn')?.addEventListener('click', async () => {
+    const form = modal.querySelector('#rejectForm') as HTMLFormElement;
+    const formData = new FormData(form);
+    const errEl = modal.querySelector('#rejectError') as HTMLElement;
+    errEl.style.display = 'none';
+    const reviewNote = (formData.get('review_note') as string) || '';
+    if (!reviewNote.trim()) {
+      errEl.textContent = '请填写拒绝原因';
+      errEl.style.display = 'block';
+      return;
+    }
+    try {
+      await api.post(`/renewals/${a.id}/reject/`, {
+        review_note: reviewNote.trim(),
+      });
+      close();
+      alert('已拒绝续期申请');
+      await loadCurrentTab();
+      renderCurrentTab(container);
+    } catch (err: any) {
+      errEl.textContent = err.message || '操作失败';
       errEl.style.display = 'block';
     }
   });

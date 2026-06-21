@@ -5,13 +5,14 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     RegisterView, LoginView, UserProfileView,
     LockerGroupViewSet, LockerViewSet, ReservationViewSet,
-    stats_view
+    RenewalApplicationViewSet, stats_view
 )
 
 router = DefaultRouter()
 router.register(r'groups', LockerGroupViewSet, basename='group')
 router.register(r'lockers', LockerViewSet, basename='locker')
 router.register(r'reservations', ReservationViewSet, basename='reservation')
+router.register(r'renewals', RenewalApplicationViewSet, basename='renewal')
 
 urlpatterns = [
     path('auth/register/', RegisterView.as_view(), name='register'),
