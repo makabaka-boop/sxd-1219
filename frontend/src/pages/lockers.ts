@@ -214,7 +214,7 @@ function showLockerDetail(locker: Locker): void {
         <div class="detail-row"><span class="detail-label">状态</span><span class="detail-value">${getStatusTag(locker.status)}</span></div>
         ${locker.description ? `<div class="detail-row"><span class="detail-label">备注</span><span class="detail-value">${locker.description}</span></div>` : ''}
         <hr style="margin:16px 0;border:none;border-top:1px solid #ebeef5;" />
-        <h4 style="margin-bottom:12px;font-size:14px;">近期预约占用</h4>
+        <h4 style="margin-bottom:12px;font-size:14px;">当前预约占用</h4>
         <div id="recentReservations" style="font-size:13px;color:#909399;">加载中...</div>
         ${locker.status === 'available' ? `
           <hr style="margin:16px 0;border:none;border-top:1px solid #ebeef5;" />
@@ -251,7 +251,7 @@ function showLockerDetail(locker: Locker): void {
   api.get<Reservation[]>(`/lockers/${locker.id}/recent_reservations/`)
     .then((recent) => {
       if (recent.length === 0) {
-        recentEl.innerHTML = '<span style="color:#67c23a;">该柜格暂无预约记录。</span>';
+        recentEl.innerHTML = '<span style="color:#67c23a;">该柜格暂无有效占用预约，可放心申请。</span>';
         return;
       }
       recentEl.innerHTML = recent.map((r) => {
@@ -278,7 +278,7 @@ function showLockerDetail(locker: Locker): void {
       }).join('');
     })
     .catch(() => {
-      recentEl.innerHTML = '<span style="color:#f56c6c;">近期预约加载失败</span>';
+      recentEl.innerHTML = '<span style="color:#f56c6c;">当前预约加载失败</span>';
     });
 
   const reserveForm = modal.querySelector('#reserveForm') as HTMLFormElement;

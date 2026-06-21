@@ -1,6 +1,6 @@
 import { api } from '../utils/api';
 import { isAdmin } from '../utils/auth';
-import type { Reservation, ReservationStatus, RenewalStatus, CreateRenewalRequest } from '../types';
+import type { Reservation, ReservationStatus, RenewalApplication, RenewalStatus, CreateRenewalRequest, WithdrawRenewalRequest } from '../types';
 
 let reservations: Reservation[] = [];
 let currentFilter: ReservationStatus | 'all' = 'all';
@@ -209,11 +209,14 @@ function showDetail(r: Reservation): void {
         <h4 style="margin-bottom:12px;font-size:14px;">续期记录</h4>
         ${renewals.length === 0
           ? '<div style="color:#909399;font-size:13px;">暂无续期申请</div>'
-          : renewals.map((a) => `
+          : renewals.map((a, idx) => `
             <div style="border:1px solid #ebeef5;border-radius:6px;padding:12px;margin-bottom:10px;">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
                 <span style="font-weight:500;">续期申请 #${a.id}</span>
-                ${getRenewalStatusTag(a.status)}
+                <div style="display:flex;gap:8px;align-items:center;">
+                  ${getRenewalStatusTag(a.status)}
+                  ${a.status === 'pending' ? `<button class="btn btn-small btn-danger" data-action="withdraw-renewal" data-idx="${idx}">撤回</button>` : ''}
+                </div>
               </div>
               <div style="font-size:13px;color:#606266;line-height:1.8;">
                 <div>原结束时间：${formatDateTime(a.original_end_time)} → 期望结束时间：${formatDateTime(a.requested_end_time)}</div>
@@ -233,6 +236,26 @@ function showDetail(r: Reservation): void {
   modal.querySelector('.modal-close')?.addEventListener('click', close);
   modal.addEventListener('click', (e) => {
     if (e.target === modal) close();
+  });
+
+  modal.querySelectorAll('button[data-action="withdraw-renewal"]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      const idx = Number((e.currentTarget as HTMLElement).dataset.idx);
+      const app = renewals[idx];
+      if (!app || app.status !== 'pending') return;
+      if (!confirm(`确定要撤回续期申请 #${app.id} 吗？`)) return;
+      try {
+        const data: WithdrawRenewalRequest = { review_note: '用户主动撤回' };
+        await api.post(`/renewals/${app.id}/withdraw/`, data);
+        close();
+        alert('续期申请已撤回');
+        await loadData();
+        const container = document.getElementById('reservations-container') as HTMLElement;
+        if (container) renderList(container);
+      } catch (err: any) {
+        alert(err.message || '撤回失败');
+      }
+    });
   });
 }
 
@@ -309,7 +332,7 @@ function showRenewDialog(r: Reservation, container: HTMLElement): void {
         <div class="detail-row"><span class="detail-label">柜格</span><span class="detail-value">${r.locker_info.code} (${r.locker_info.group_name})</span></div>
         <div class="detail-row"><span class="detail-label">当前结束时间</span><span class="detail-value">${formatDateTime(r.end_time)}</span></div>
         <hr style="margin:16px 0;border:none;border-top:1px solid #ebeef5;" />
-        <div id="renewHint" style="margin-bottom:12px;font-size:13px;color:#909399;">正在加载该柜格近期预约...</div>
+        <div id="renewHint" style="margin-bottom:12px;font-size:13px;color:#909399;">正在加载该柜格占用预约...</div>
         <form id="renewForm">
           <div class="form-item">
             <label class="form-label">期望延长结束时间 *</label>

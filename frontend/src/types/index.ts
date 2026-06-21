@@ -134,3 +134,7 @@ export interface CreateRenewalRequest {
 export interface ReviewRenewalRequest {
   review_note?: string;
 }
+
+export interface WithdrawRenewalRequest {
+  review_note?: string;
+}

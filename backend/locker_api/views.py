@@ -92,12 +92,13 @@ class LockerViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
     def recent_reservations(self, request, pk=None):
         locker = self.get_object()
-        reservations = Reservation.objects.filter(
-            locker=locker
+        active_reservations = Reservation.objects.filter(
+            locker=locker,
+            status__in=[Reservation.STATUS_PENDING, Reservation.STATUS_ACTIVE]
         ).select_related(
             'user', 'locker', 'locker__locker_group', 'cleaned_by'
-        ).order_by('-created_at')[:5]
-        serializer = ReservationSerializer(reservations, many=True)
+        ).order_by('start_time')
+        serializer = ReservationSerializer(active_reservations, many=True)
         return Response(serializer.data)
 
 
@@ -324,6 +325,38 @@ class RenewalApplicationViewSet(viewsets.ModelViewSet):
         application.review_note = review_note
         application.save()
         return Response(RenewalApplicationSerializer(application).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def withdraw(self, request, pk=None):
+        application = self.get_object()
+        if application.user_id != request.user.id and request.user.role != 'admin':
+            return Response({'error': '无权限操作该申请'}, status=status.HTTP_403_FORBIDDEN)
+        if application.status != RenewalApplication.STATUS_PENDING:
+            return Response({'error': '仅待审批的申请可撤回'}, status=status.HTTP_400_BAD_REQUEST)
+
+        application.status = RenewalApplication.STATUS_REJECTED
+        application.reviewed_at = timezone.now()
+        application.review_note = request.data.get('review_note', '用户主动撤回')
+        application.save()
+        return Response(RenewalApplicationSerializer(application).data)
+
+    def update(self, request, *args, **kwargs):
+        return Response(
+            {'error': '续期申请不可直接修改，请撤回后重新提交'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        return Response(
+            {'error': '续期申请不可直接修改，请撤回后重新提交'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        return Response(
+            {'error': '续期申请不可删除，如需取消请使用撤回功能'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED
+        )
 
     def _refresh_locker_status(self, locker):
         now = timezone.now()
