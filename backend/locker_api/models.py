@@ -98,6 +98,8 @@ class Reservation(models.Model):
     cleaned_by = models.ForeignKey(User, on_delete=models.SET_NULL, blank=True, null=True, related_name='cleaned_reservations', verbose_name='清理人')
     cleaned_at = models.DateTimeField(blank=True, null=True, verbose_name='清理时间')
     clean_note = models.TextField(blank=True, null=True, verbose_name='清理备注')
+    is_changed = models.BooleanField(default=False, verbose_name='是否改签过')
+    change_count = models.IntegerField(default=0, verbose_name='改签次数')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
 
@@ -109,6 +111,40 @@ class Reservation(models.Model):
 
     def __str__(self):
         return f'{self.user.username} - {self.locker.code}'
+
+
+class ReservationChangeHistory(models.Model):
+    CHANGE_TYPE_TIME = 'time'
+    CHANGE_TYPE_LOCKER = 'locker'
+    CHANGE_TYPE_BOTH = 'both'
+    CHANGE_TYPE_CHOICES = [
+        (CHANGE_TYPE_TIME, '修改时间'),
+        (CHANGE_TYPE_LOCKER, '更换柜格'),
+        (CHANGE_TYPE_BOTH, '修改时间并更换柜格'),
+    ]
+
+    reservation = models.ForeignKey(Reservation, on_delete=models.CASCADE, related_name='change_histories', verbose_name='预约记录')
+    changed_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reservation_changes', verbose_name='改签人')
+    change_type = models.CharField(max_length=20, choices=CHANGE_TYPE_CHOICES, verbose_name='改签类型')
+    original_locker = models.ForeignKey(Locker, on_delete=models.SET_NULL, blank=True, null=True, related_name='+', verbose_name='原柜格')
+    original_locker_code = models.CharField(max_length=50, blank=True, null=True, verbose_name='原柜格编号')
+    new_locker = models.ForeignKey(Locker, on_delete=models.SET_NULL, blank=True, null=True, related_name='+', verbose_name='新柜格')
+    new_locker_code = models.CharField(max_length=50, blank=True, null=True, verbose_name='新柜格编号')
+    original_start_time = models.DateTimeField(verbose_name='原开始时间')
+    original_end_time = models.DateTimeField(verbose_name='原结束时间')
+    new_start_time = models.DateTimeField(verbose_name='新开始时间')
+    new_end_time = models.DateTimeField(verbose_name='新结束时间')
+    change_reason = models.TextField(blank=True, null=True, verbose_name='改签原因')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='改签时间')
+
+    class Meta:
+        db_table = 'reservation_change_history'
+        verbose_name = '预约改签记录'
+        verbose_name_plural = '预约改签记录'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'改签记录 #{self.id} - 预约#{self.reservation_id}'
 
 
 class RenewalApplication(models.Model):

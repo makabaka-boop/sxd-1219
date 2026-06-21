@@ -8,11 +8,12 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate, get_user_model
 
-from .models import LockerGroup, Locker, Reservation, RenewalApplication
+from .models import LockerGroup, Locker, Reservation, ReservationChangeHistory, RenewalApplication
 from .serializers import (
     UserSerializer, RegisterSerializer,
     LockerGroupSerializer, LockerSerializer, ReservationSerializer,
-    RenewalApplicationSerializer
+    ReservationChangeHistorySerializer, RescheduleRequestSerializer,
+    CheckAvailabilityRequestSerializer, RenewalApplicationSerializer
 )
 from .permissions import IsAdmin, IsAdminOrReadOnly, IsOwnerOrAdmin
 
@@ -220,6 +221,159 @@ class ReservationViewSet(viewsets.ModelViewSet):
         reservation.clean_note = request.data.get('clean_note', '')
         reservation.save()
         self._update_locker_status(reservation.locker)
+        return Response(ReservationSerializer(reservation).data)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def check_availability(self, request):
+        serializer = CheckAvailabilityRequestSerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+
+        locker_id = serializer.validated_data['locker']
+        start_time = serializer.validated_data['start_time']
+        end_time = serializer.validated_data['end_time']
+        exclude_id = serializer.validated_data.get('exclude_reservation')
+
+        try:
+            locker = Locker.objects.get(id=locker_id)
+        except Locker.DoesNotExist:
+            return Response({'error': '柜格不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        if locker.status == Locker.STATUS_PAUSED:
+            return Response({
+                'available': False,
+                'error': '该柜格已暂停开放，暂不可预约'
+            })
+
+        has_conflict = self.check_time_conflict(locker_id, start_time, end_time, exclude_id)
+
+        return Response({
+            'available': not has_conflict,
+            'locker': locker_id,
+            'start_time': start_time,
+            'end_time': end_time,
+            'conflict': has_conflict
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def available_lockers_in_group(self, request):
+        group_id = request.query_params.get('group')
+        start_time = request.query_params.get('start_time')
+        end_time = request.query_params.get('end_time')
+        exclude_reservation = request.query_params.get('exclude_reservation')
+
+        if not group_id:
+            return Response({'error': '请指定柜组ID'}, status=status.HTTP_400_BAD_REQUEST)
+        if not start_time or not end_time:
+            return Response({'error': '请指定开始和结束时间'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            group = LockerGroup.objects.get(id=group_id)
+        except LockerGroup.DoesNotExist:
+            return Response({'error': '柜组不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+        lockers = Locker.objects.filter(
+            locker_group=group,
+            status__in=[Locker.STATUS_AVAILABLE, Locker.STATUS_RESERVED]
+        ).select_related('locker_group')
+
+        available_lockers = []
+        for locker in lockers:
+            if locker.status == Locker.STATUS_PAUSED:
+                continue
+            has_conflict = self.check_time_conflict(
+                locker.id, start_time, end_time, exclude_reservation
+            )
+            if not has_conflict:
+                available_lockers.append(locker)
+
+        serializer = LockerSerializer(available_lockers, many=True)
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsOwnerOrAdmin])
+    def reschedule(self, request, pk=None):
+        reservation = self.get_object()
+
+        if reservation.status != Reservation.STATUS_PENDING:
+            return Response({'error': '仅待使用的预约可改签'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if timezone.now() >= reservation.start_time:
+            return Response({'error': '预约已开始，不可改签'}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = RescheduleRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        new_locker_id = serializer.validated_data.get('locker')
+        new_start_time = serializer.validated_data.get('start_time')
+        new_end_time = serializer.validated_data.get('end_time')
+        change_reason = serializer.validated_data.get('change_reason', '')
+
+        original_locker = reservation.locker
+        original_start_time = reservation.start_time
+        original_end_time = reservation.end_time
+
+        target_locker_id = new_locker_id if new_locker_id else reservation.locker_id
+        target_start_time = new_start_time if new_start_time else reservation.start_time
+        target_end_time = new_end_time if new_end_time else reservation.end_time
+
+        if new_locker_id:
+            if new_locker_id == reservation.locker_id and not new_start_time:
+                return Response({'error': '未做任何修改'}, status=status.HTTP_400_BAD_REQUEST)
+            try:
+                new_locker = Locker.objects.get(id=new_locker_id)
+            except Locker.DoesNotExist:
+                return Response({'error': '目标柜格不存在'}, status=status.HTTP_404_NOT_FOUND)
+
+            if new_locker.locker_group_id != reservation.locker.locker_group_id:
+                return Response({'error': '只能更换同柜组内的柜格'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if new_locker.status == Locker.STATUS_PAUSED:
+                return Response({'error': '目标柜格已暂停开放'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            new_locker = reservation.locker
+            if not new_start_time:
+                return Response({'error': '未做任何修改'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if self.check_time_conflict(target_locker_id, target_start_time, target_end_time, reservation.id):
+            return Response({'error': '目标柜格在该时间段已被预约'}, status=status.HTTP_400_BAD_REQUEST)
+
+        locker_changed = new_locker_id is not None and new_locker_id != reservation.locker_id
+        time_changed = new_start_time is not None
+
+        if locker_changed and time_changed:
+            change_type = ReservationChangeHistory.CHANGE_TYPE_BOTH
+        elif locker_changed:
+            change_type = ReservationChangeHistory.CHANGE_TYPE_LOCKER
+        else:
+            change_type = ReservationChangeHistory.CHANGE_TYPE_TIME
+
+        old_locker = reservation.locker
+
+        reservation.locker = new_locker
+        reservation.start_time = target_start_time
+        reservation.end_time = target_end_time
+        reservation.is_changed = True
+        reservation.change_count += 1
+        reservation.save()
+
+        ReservationChangeHistory.objects.create(
+            reservation=reservation,
+            changed_by=request.user,
+            change_type=change_type,
+            original_locker=original_locker,
+            original_locker_code=original_locker.code,
+            new_locker=new_locker,
+            new_locker_code=new_locker.code,
+            original_start_time=original_start_time,
+            original_end_time=original_end_time,
+            new_start_time=target_start_time,
+            new_end_time=target_end_time,
+            change_reason=change_reason
+        )
+
+        if locker_changed:
+            self._update_locker_status(old_locker)
+        self._update_locker_status(new_locker)
+
         return Response(ReservationSerializer(reservation).data)
 
 
